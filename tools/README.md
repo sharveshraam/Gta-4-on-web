@@ -57,12 +57,26 @@ couple of minutes, at the cost of not being able to detect file corruption.
 | `tree.txt` | Directory tree, two levels, with file counts and summed sizes |
 | `manifest.csv` | `relative_path, size_bytes, sha256` for every file |
 
-Then share it however is easiest:
+Then share it — **but note that direct chat file uploads do not reliably reach the
+analysis sandbox.** The dependable route is git:
 
-- paste **`summary.txt`** straight into chat (it is ~5 KB), **or**
-- `git add tools/gta4-inventory && git commit && git push` — it is plain text and
-  contains no game content, **or**
-- attach the folder.
+```bash
+# recommended — commit the inventory into the repo
+mkdir -p inventory
+cp tools/gta4-inventory/* inventory/
+git add inventory/
+git commit -m "Add GTA IV installation inventory"
+git push
+```
+
+I can then `git fetch` it and analyse it directly. See `inventory/README.md`.
+
+Ranked by reliability:
+
+1. **Commit to `inventory/` and push** — ✅ most reliable, I can always fetch it
+2. **Paste `summary.txt` into chat** (~5 KB) — ✅ works, small enough to paste
+3. **Chat attachment** — ⚠️ may not arrive; if I say I cannot see it, use 1 or 2
+4. **Zip and upload the install** — ❌ never do this
 
 ### Option 2 — Just start Phase 2 and report back numbers
 

@@ -168,6 +168,10 @@ powershell -ExecutionPolicy Bypass -File .\tools\gta4-inventory.ps1 `
 chmod +x tools/gta4-inventory.sh && ./tools/gta4-inventory.sh
 ```
 
+Commit the result to `inventory/` and push it — **I can always `git fetch` it from
+GitHub, whereas chat attachments do not reliably reach the analysis sandbox.** See
+[`inventory/README.md`](inventory/README.md).
+
 It writes **`tools/gta4-inventory/`** — about **1 MB of text**, i.e. ~0.005% of the install:
 
 | File | Contents |
@@ -177,6 +181,8 @@ It writes **`tools/gta4-inventory/`** — about **1 MB of text**, i.e. ~0.005% o
 | `manifest.csv` | `relative_path, size_bytes, sha256` for every file |
 
 Then paste `summary.txt` into chat (~5 KB), or commit the whole folder — it is plain text with no game content.
+
+Once a manifest lands, `python3 tools/analyse-manifest.py inventory/manifest.csv` turns it into a structured `GAME_FILE_INVENTORY.md`: edition and layout, executable inventory, archive totals, audio, `.sco` scripts, mod markers, extension breakdown, and a present/missing check for every data file the browser port depends on. The analyser auto-detects CSV dialect and column names, and strips any install prefix from absolute paths.
 
 **Options ranked:**
 
