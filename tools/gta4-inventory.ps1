@@ -143,8 +143,11 @@ The folder you want is the one containing GTAIV.exe (on Steam it is usually the
 
 $root = Resolve-GameDir -Hint $GameDir
 
+# NOTE: do NOT join 'gta4-inventory' twice here. An earlier build did
+# (Join-Path (Join-Path $PSScriptRoot 'gta4-inventory') 'gta4-inventory'), which
+# silently wrote everything one directory deeper than documented and made
+# -ReuseManifest look in the wrong place.
 if (-not $OutDir) { $OutDir = Join-Path $PSScriptRoot 'gta4-inventory' }
-$OutDir = Join-Path $OutDir 'gta4-inventory'
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
 $csvPath  = Join-Path $OutDir 'manifest.csv'
@@ -297,8 +300,36 @@ function Get-ArchiveMagic {
 $files = @()
 
 if ($ReuseManifest) {
+    # An earlier build wrote one directory deeper than documented. Rather than
+    # make the user move files, look in the expected place, then the legacy
+    # nested location, then anywhere underneath OutDir.
     if (-not (Test-Path -LiteralPath $csvPath)) {
-        throw "-ReuseManifest was requested but no manifest.csv exists at: $csvPath"
+        $candidates = @(
+            (Join-Path $OutDir 'gta4-inventory\manifest.csv')
+            (Join-Path $OutDir '..\*\manifest.csv')
+        )
+        foreach ($c in $candidates) {
+            $hit = @(Get-ChildItem -Path $c -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if ((Get-SafeCount $hit) -gt 0) { $csvPath = $hit[0].FullName; break }
+        }
+    }
+    if (-not (Test-Path -LiteralPath $csvPath)) {
+        $hit = @(Get-ChildItem -LiteralPath $OutDir -Recurse -Filter 'manifest.csv' -ErrorAction SilentlyContinue |
+                 Select-Object -First 1)
+        if ((Get-SafeCount $hit) -gt 0) { $csvPath = $hit[0].FullName }
+    }
+    if (-not (Test-Path -LiteralPath $csvPath)) {
+        throw @"
+-ReuseManifest was requested but no manifest.csv was found under:
+  $OutDir
+
+Searched the expected location, the legacy nested 'gta4-inventory' subfolder,
+and everything beneath OutDir. Either run a full scan first (without
+-ReuseManifest), or pass -OutDir pointing at the folder holding manifest.csv.
+"@
+    }
+    if ($csvPath -ne (Join-Path $OutDir 'manifest.csv')) {
+        Write-Host "  Found manifest at: $csvPath" -ForegroundColor DarkGray
     }
     Write-Host "  Reusing existing manifest.csv (no re-hashing)." -ForegroundColor Yellow
     $rows = @(Import-Csv -LiteralPath $csvPath)
