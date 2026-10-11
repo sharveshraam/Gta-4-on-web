@@ -34,6 +34,20 @@ chmod +x tools/gta4-inventory.sh
 Add `-NoHash` (Windows) or `-n` (Linux/macOS) to skip SHA-256 — seconds instead
 of minutes.
 
+### Regenerate the reports without re-hashing
+
+If a run already produced `manifest.csv` and then stopped, don't scan again:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\gta4-inventory.ps1 -ReuseManifest
+```
+
+That loads the existing `manifest.csv` and writes only `tree.txt` and
+`summary.txt` — seconds instead of re-hashing the whole installation.
+
+`-SkipManifest` is the variant that still walks the tree but never writes or
+hashes `manifest.csv`.
+
 It writes `tools/gta4-inventory/`:
 
 | File | What is in it |

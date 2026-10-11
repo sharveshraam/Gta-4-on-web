@@ -17,6 +17,9 @@
     The installation root path is REDACTED from every output. Paths are written
     relative to the game root. Nothing here contains game content.
 
+    Each output is written independently, and every section is fault-isolated:
+    a failure in one section degrades that section and still writes the rest.
+
 .PARAMETER GameDir
     Path to the GTA IV installation root (the folder containing GTAIV.exe).
     If omitted, common Steam / Rockstar / Epic paths are probed.
@@ -27,11 +30,25 @@
 .PARAMETER NoHash
     Skip SHA-256 (much faster; ~seconds instead of minutes). Sizes and names only.
 
+.PARAMETER ReuseManifest
+    Do NOT re-scan or re-hash. Load the existing manifest.csv from OutDir and
+    regenerate tree.txt and summary.txt from it. Use this after a crash so the
+    expensive hashing pass is not repeated.
+
+.PARAMETER SkipManifest
+    Skip writing manifest.csv but still walk the tree (fast). Use when you want
+    tree.txt and summary.txt without paying for hashes.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\tools\gta4-inventory.ps1
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\tools\gta4-inventory.ps1 -GameDir "D:\Games\Grand Theft Auto IV\GTAIV"
+    powershell -ExecutionPolicy Bypass -File .\tools\gta4-inventory.ps1 `
+      -GameDir "D:\Games\Grand Theft Auto IV\GTAIV"
+
+.EXAMPLE
+    # after a crash - regenerate the reports without re-hashing anything
+    powershell -ExecutionPolicy Bypass -File .\tools\gta4-inventory.ps1 -ReuseManifest
 
 .NOTES
     Read-only. Opens files, reads at most a few header bytes, never executes
@@ -42,11 +59,52 @@
 param(
     [string] $GameDir,
     [string] $OutDir,
-    [switch] $NoHash
+    [switch] $NoHash,
+    [switch] $ReuseManifest,
+    [switch] $SkipManifest
 )
 
-$ErrorActionPreference = 'Stop'
-Set-StrictMode -Version Latest
+# NOTE: StrictMode is deliberately NOT enabled. Under Set-StrictMode, reading
+# .Count (or any property) on $null throws - and Get-ChildItem returns $null for
+# an empty directory. That turned a harmless empty folder into a fatal crash that
+# discarded tree.txt and summary.txt after the slow hashing pass had already
+# completed. Every count and sum below is now explicitly null-safe instead.
+
+$ErrorActionPreference = 'Continue'
+$ProgressPreference    = 'SilentlyContinue'
+
+# ------------------------------------------------------------- null-safe utils
+
+function Get-SafeCount {
+    param([object] $Value)
+    if ($null -eq $Value) { return 0 }
+    try { return @($Value).Count } catch { return 0 }
+}
+
+function Get-SafeSum {
+    param([object] $Items)
+    if ($null -eq $Items) { return [int64]0 }
+    try {
+        $s = ($Items | Measure-Object -Property Length -Sum).Sum
+        if ($null -eq $s) { return [int64]0 }
+        return [int64]$s
+    } catch { return [int64]0 }
+}
+
+function Add-Section {
+    param(
+        [System.Collections.Generic.List[string]] $Target,
+        [string] $Name,
+        [scriptblock] $Body
+    )
+    try { & $Body }
+    catch {
+        $Target.Add("")
+        $Target.Add("  [section '$Name' failed: $($_.Exception.Message)]")
+        $Target.Add("  The rest of this report is unaffected.")
+        Write-Warning "Section '$Name' failed: $($_.Exception.Message)"
+    }
+}
 
 # ---------------------------------------------------------------- locate game
 
@@ -89,6 +147,10 @@ if (-not $OutDir) { $OutDir = Join-Path $PSScriptRoot 'gta4-inventory' }
 $OutDir = Join-Path $OutDir 'gta4-inventory'
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
+$csvPath  = Join-Path $OutDir 'manifest.csv'
+$treePath = Join-Path $OutDir 'tree.txt'
+$sumPath  = Join-Path $OutDir 'summary.txt'
+
 Write-Host ""
 Write-Host "  GTA IV inventory" -ForegroundColor Cyan
 Write-Host "  root : $root"
@@ -101,17 +163,19 @@ function Get-PEHeader {
     param([string] $Path)
 
     $result = [ordered]@{
-        File            = Split-Path -Leaf $Path
-        SizeBytes       = (Get-Item -LiteralPath $Path).Length
-        Format          = 'unknown'
-        Machine         = 'unknown'
-        Bitness         = 'unknown'
+        File              = Split-Path -Leaf $Path
+        SizeBytes         = 0
+        Format            = 'unknown'
+        Machine           = 'unknown'
+        Bitness           = 'unknown'
         LargeAddressAware = 'unknown'
-        Subsystem       = 'unknown'
-        LinkTimestamp   = 'unknown'
-        ProductVersion  = 'unknown'
-        FileVersion     = 'unknown'
+        Subsystem         = 'unknown'
+        LinkTimestamp     = 'unknown'
+        ProductVersion    = 'unknown'
+        FileVersion       = 'unknown'
     }
+
+    try { $result.SizeBytes = (Get-Item -LiteralPath $Path).Length } catch { }
 
     try {
         $vi = (Get-Item -LiteralPath $Path).VersionInfo
@@ -122,7 +186,7 @@ function Get-PEHeader {
     $fs = $null
     try {
         $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'Read')
-        if ($fs.Length -lt 0x40) { return $result }
+        if ($fs.Length -lt 0x40) { $result.Format = 'too small to be a PE'; return $result }
         $br = New-Object System.IO.BinaryReader($fs)
 
         $fs.Position = 0
@@ -135,12 +199,12 @@ function Get-PEHeader {
         $fs.Position = $lfanew
         if ($br.ReadUInt32() -ne 0x00004550) { $result.Format = 'MZ without PE signature'; return $result }
 
-        $machine        = $br.ReadUInt16()
-        $null           = $br.ReadUInt16()   # NumberOfSections
-        $timeStamp      = $br.ReadUInt32()
-        $null           = $br.ReadUInt32()   # PointerToSymbolTable
-        $null           = $br.ReadUInt32()   # NumberOfSymbols
-        $sizeOfOptHdr   = $br.ReadUInt16()
+        $machine         = $br.ReadUInt16()
+        $null            = $br.ReadUInt16()   # NumberOfSections
+        $timeStamp       = $br.ReadUInt32()
+        $null            = $br.ReadUInt32()   # PointerToSymbolTable
+        $null            = $br.ReadUInt32()   # NumberOfSymbols
+        $sizeOfOptHdr    = $br.ReadUInt16()
         $characteristics = $br.ReadUInt16()
 
         $result.Format = 'PE (Portable Executable)'
@@ -155,10 +219,10 @@ function Get-PEHeader {
         $result.LargeAddressAware = if ($characteristics -band 0x0020) { 'YES' } else { 'no' }
 
         if ($timeStamp -gt 0) {
-            $result.LinkTimestamp = ([datetime]'1970-01-01T00:00:00Z').AddSeconds($timeStamp).ToString('u')
+            try { $result.LinkTimestamp = ([datetime]'1970-01-01T00:00:00Z').AddSeconds($timeStamp).ToString('u') }
+            catch { $result.LinkTimestamp = "$timeStamp (raw)" }
         }
 
-        # Optional header: magic at +0, Subsystem at +68 (PE32) / +68 (PE32+ too)
         if ($sizeOfOptHdr -ge 70) {
             $optStart = $lfanew + 24
             $fs.Position = $optStart
@@ -171,8 +235,8 @@ function Get-PEHeader {
                 9 { 'Windows CE' }
                 default { ('0x{0:x}' -f $subsystem) }
             }
-            if ($magic -eq 0x20b) { $result.Bitness = '64-bit (PE32+)' }
-            elseif ($magic -eq 0x10b) { $result.Bitness = '32-bit (PE32)' }
+            if ($magic -eq 0x20b)      { $result.Bitness = '64-bit (PE32+)' }
+            elseif ($magic -eq 0x10b)  { $result.Bitness = '32-bit (PE32)' }
         }
     }
     catch { $result.Format = "read error: $($_.Exception.Message)" }
@@ -204,8 +268,6 @@ function Get-ArchiveMagic {
             'RPF8' { return 'RPF8  - RDR2 archive' }
         }
 
-        # IMG v2/v3 magic is the Jenkins hash of "V"/"VER2"/"VER3"
-        #   VER2 = 0x32524556, VER3 = 0x33524556
         $u32 = [System.BitConverter]::ToUInt32($buf, 0)
         switch ($u32) {
             0x32524556 { return 'IMG2  (VER2) - RenderWare-era archive' }
@@ -230,267 +292,327 @@ function Get-ArchiveMagic {
     finally { if ($fs) { $fs.Dispose() } }
 }
 
-# ------------------------------------------------------------------ inventory
+# =========================================================== 1. manifest.csv
 
-$files = Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
-         Sort-Object FullName
+$files = @()
 
-Write-Host "  Found $($files.Count) files." -ForegroundColor Gray
-
-# manifest.csv -----------------------------------------------------------------
-
-$csvPath = Join-Path $OutDir 'manifest.csv'
-$csv = New-Object System.Collections.Generic.List[string]
-$csv.Add('relative_path,size_bytes,sha256')
-
-$sw = [System.Diagnostics.Stopwatch]::StartNew()
-$i = 0
-foreach ($f in $files) {
-    $i++
-    $rel = $f.FullName.Substring($root.Length).TrimStart('\', '/')
-    $sha = ''
-    if (-not $NoHash) {
-        try { $sha = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
-        catch { $sha = 'ERROR' }
+if ($ReuseManifest) {
+    if (-not (Test-Path -LiteralPath $csvPath)) {
+        throw "-ReuseManifest was requested but no manifest.csv exists at: $csvPath"
     }
-    # Quote and escape for CSV
-    $relEsc = '"' + ($rel -replace '"', '""') + '"'
-    $csv.Add("$relEsc,$($f.Length),$sha")
-
-    if ($i % 250 -eq 0) {
-        $pct = [int]($i / $files.Count * 100)
-        Write-Progress -Activity 'Inventorying GTA IV' -Status "$i / $($files.Count)" -PercentComplete $pct
+    Write-Host "  Reusing existing manifest.csv (no re-hashing)." -ForegroundColor Yellow
+    $rows = @(Import-Csv -LiteralPath $csvPath)
+    # Build into a List: repeated array += is O(n^2) and painfully slow at 5-6k rows.
+    $reused = New-Object System.Collections.Generic.List[object]
+    foreach ($r in $rows) {
+        $rel = [string]$r.relative_path
+        if ([string]::IsNullOrWhiteSpace($rel)) { continue }
+        $sz = [int64]0
+        [void][int64]::TryParse([string]$r.size_bytes, [ref]$sz)
+        $reused.Add([pscustomobject]@{
+            FullName = (Join-Path $root $rel)
+            Length   = $sz
+        })
     }
+    $files = $reused.ToArray()
+    Write-Host "  Loaded $(Get-SafeCount $files) entries from manifest.csv." -ForegroundColor Gray
 }
-Write-Progress -Activity 'Inventorying GTA IV' -Completed
+else {
+    $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+               Sort-Object FullName)
+    Write-Host "  Found $(Get-SafeCount $files) files." -ForegroundColor Gray
 
-$csv | Set-Content -LiteralPath $csvPath -Encoding UTF8
-$sw.Stop()
-Write-Host "  manifest.csv   written ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Green
+    if (-not $SkipManifest) {
+        $csv = New-Object System.Collections.Generic.List[string]
+        $csv.Add('relative_path,size_bytes,sha256')
 
-# tree.txt ---------------------------------------------------------------------
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $i = 0
+        $total = Get-SafeCount $files
+        foreach ($f in $files) {
+            $i++
+            $rel = $f.FullName.Substring($root.Length).TrimStart('\', '/')
+            $sha = ''
+            if (-not $NoHash) {
+                try { $sha = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+                catch { $sha = 'ERROR' }
+            }
+            $relEsc = '"' + ($rel -replace '"', '""') + '"'
+            $csv.Add("$relEsc,$($f.Length),$sha")
 
-$treePath = Join-Path $OutDir 'tree.txt'
-$tree = New-Object System.Collections.Generic.List[string]
-$tree.Add("GTA IV installation tree (2 levels, sizes summed). Root path redacted.")
-$tree.Add("Generated: $((Get-Date).ToString('u'))")
-$tree.Add("")
-foreach ($d in (Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Sort-Object Name)) {
-    $sub = Get-ChildItem -LiteralPath $d.FullName -Recurse -File -ErrorAction SilentlyContinue
-    $sum = ($sub | Measure-Object -Property Length -Sum).Sum
-    if (-not $sum) { $sum = 0 }
-    $tree.Add(("{0,-42} {1,7} files {2,12:N0} bytes" -f ($d.Name + '\'), $sub.Count, $sum))
-    foreach ($d2 in (Get-ChildItem -LiteralPath $d.FullName -Directory -ErrorAction SilentlyContinue | Sort-Object Name)) {
-        $sub2 = Get-ChildItem -LiteralPath $d2.FullName -Recurse -File -ErrorAction SilentlyContinue
-        $sum2 = ($sub2 | Measure-Object -Property Length -Sum).Sum
-        if (-not $sum2) { $sum2 = 0 }
-        $tree.Add(("  {0,-40} {1,7} files {2,12:N0} bytes" -f ($d2.Name + '\'), $sub2.Count, $sum2))
-    }
-}
-$tree | Set-Content -LiteralPath $treePath -Encoding UTF8
-Write-Host "  tree.txt       written" -ForegroundColor Green
-
-# summary.txt ------------------------------------------------------------------
-
-$sum = New-Object System.Collections.Generic.List[string]
-$total = ($files | Measure-Object -Property Length -Sum).Sum
-
-function Add($s) { $sum.Add($s) }
-
-Add '================================================================================'
-Add ' GTA IV INSTALLATION INVENTORY'
-Add '================================================================================'
-Add " Generated          : $((Get-Date).ToString('u'))"
-Add " Scanner            : tools/gta4-inventory.ps1"
-Add " Root path          : (redacted - not recorded)"
-Add " Total files        : $($files.Count)"
-Add " Total size         : $([math]::Round($total / 1GB, 2)) GB  ($('{0:N0}' -f $total) bytes)"
-Add ''
-Add ' NOTE ON SHARING'
-Add ' ----------------'
-Add ' This file contains filenames, sizes and hashes ONLY. It contains no game'
-Add ' content and is safe to commit to a public repository or paste into a chat.'
-Add ' The installation root path has been deliberately redacted.'
-Add ''
-
-# --- executables
-Add '================================================================================'
-Add ' EXECUTABLES'
-Add '================================================================================'
-foreach ($name in @('GTAIV.exe', 'LaunchGTAIV.exe', 'EFLC.exe', 'LaunchEFLC.exe')) {
-    $p = Join-Path $root $name
-    if (Test-Path -LiteralPath $p) {
-        $pe = Get-PEHeader -Path $p
-        Add ''
-        Add " $name"
-        foreach ($k in $pe.Keys) { Add ("   {0,-20} {1}" -f ($k + ':'), $pe[$k]) }
-    }
-}
-Add ''
-
-# --- native DLL dependencies
-Add '================================================================================'
-Add ' NATIVE DLL DEPENDENCIES / MIDDLEWARE MARKERS'
-Add '================================================================================'
-$markers = @(
-    'binkw32.dll', 'bink2w32.dll', 'xlive.dll', 'd3d9.dll', 'd3dx9_40.dll',
-    'd3dx9_41.dll', 'd3dx9_42.dll', 'd3dx9_43.dll', 'xinput1_3.dll', 'x3daudio1_7.dll',
-    'dsound.dll', 'GTAIVGDF.dll', 'LiveTokenHelper.dll', 'GameuxInstallHelper.dll',
-    'Paul.dll', 'DFA.dll', '1911.dll', 'openal32.dll', 'OpenAL32.dll',
-    'vorbisfile.dll', 'libspeex.dll', 'GFWLDownload.dll', 'ScriptHook.dll',
-    'ScriptHookDotNet.dll', 'dinput8.dll', 'winmm.dll'
-)
-foreach ($m in $markers) {
-    if (Test-Path -LiteralPath (Join-Path $root $m)) {
-        $fi = Get-Item -LiteralPath (Join-Path $root $m)
-        Add ("   {0,-26} present   {1,12:N0} bytes" -f $m, $fi.Length)
-    }
-}
-$foundDlls = Get-ChildItem -LiteralPath $root -Filter '*.dll' -File -ErrorAction SilentlyContinue |
-             Select-Object -ExpandProperty Name | Sort-Object
-if ($foundDlls) {
-    Add ''
-    Add "   All DLLs in root: $($foundDlls -join ', ')"
-}
-Add ''
-
-# --- archive fingerprints
-Add '================================================================================'
-Add ' ARCHIVE FINGERPRINTS (first 16 bytes; identifies the container format)'
-Add '================================================================================'
-$rpf = $files | Where-Object { $_.Extension -match '^\.(rpf|img)$' } | Sort-Object FullName
-Add ''
-Add " Scanning $($rpf.Count) .rpf / .img archives..."
-Add ''
-$magicTally = @{}
-$samples = @{}
-foreach ($a in $rpf) {
-    $rel = $a.FullName.Substring($root.Length).TrimStart('\', '/')
-    $m = Get-ArchiveMagic -Path $a.FullName
-    $key = ($m -split '\s+')[0]
-    if (-not $magicTally.ContainsKey($key)) {
-        $magicTally[$key] = 0
-        $samples[$key] = @()
-    }
-    $magicTally[$key]++
-    if ($samples[$key].Count -lt 3) { $samples[$key] += $rel }
-}
-Add ' Summary by magic:'
-foreach ($k in ($magicTally.Keys | Sort-Object { -$magicTally[$_] })) {
-    Add ("   {0,-12} {1,5} file(s)   e.g. {2}" -f $k, $magicTally[$k], ($samples[$k] -join ', '))
-}
-Add ''
-Add ' Largest 15 archives:'
-foreach ($a in ($rpf | Sort-Object Length -Descending | Select-Object -First 15)) {
-    $rel = $a.FullName.Substring($root.Length).TrimStart('\', '/')
-    $m = Get-ArchiveMagic -Path $a.FullName
-    Add ("   {0,-52} {1,10:N0} bytes   {2}" -f $rel, $a.Length, $m)
-}
-Add ''
-
-# --- extension breakdown
-Add '================================================================================'
-Add ' FILE COUNT AND SIZE BY EXTENSION (top 40 by count)'
-Add '================================================================================'
-Add ("   {0,-14} {1,8} {2,16} {3,12}" -f 'EXT', 'COUNT', 'BYTES', 'GB')
-$byExt = $files | Group-Object { if ($_.Extension) { $_.Extension.ToLowerInvariant() } else { '(none)' } }
-foreach ($g in ($byExt | Sort-Object Count -Descending | Select-Object -First 40)) {
-    $s = ($g.Group | Measure-Object -Property Length -Sum).Sum
-    Add ("   {0,-14} {1,8} {2,16:N0} {3,12:N3}" -f $g.Name, $g.Count, $s, ($s / 1GB))
-}
-Add ''
-
-# --- edition / version detection
-Add '================================================================================'
-Add ' EDITION AND VERSION MARKERS'
-Add '================================================================================'
-$checks = @(
-    @{ Label = 'GTA IV base (common/data)';        Path = 'common\data' }
-    @{ Label = 'TLAD episode (The Lost and Damned)'; Path = 'TLAD' }
-    @{ Label = 'TBoGT episode (Ballad of Gay Tony)'; Path = 'TBoGT' }
-    @{ Label = 'EFLC root';                        Path = 'EFLC' }
-    @{ Label = 'PC data tree';                     Path = 'pc' }
-    @{ Label = 'Common tree';                      Path = 'common' }
-    @{ Label = 'Shaders (common/shaders)';         Path = 'common\shaders' }
-    @{ Label = 'Shader DB (common/shaders/db)';    Path = 'common\shaders\db' }
-    @{ Label = 'Audio (pc/audio)';                 Path = 'pc\audio' }
-    @{ Label = 'SFX (pc/audio/sfx)';               Path = 'pc\audio\sfx' }
-    @{ Label = 'Radio (pc/audio/radio)';           Path = 'pc\audio\radio' }
-    @{ Label = 'Models (pc/models/cdimages)';      Path = 'pc\models\cdimages' }
-    @{ Label = 'Textures (pc/textures)';           Path = 'pc\textures' }
-    @{ Label = 'Map data (pc/data/cdimages)';      Path = 'pc\data\cdimages' }
-    @{ Label = 'Navmeshes dir';                    Path = 'pc\data\cdimages' }
-    @{ Label = 'Installers';                       Path = 'Installers' }
-    @{ Label = 'DirectX redist';                   Path = 'Installers\DirectX' }
-)
-foreach ($c in $checks) {
-    $p = Join-Path $root $c.Path
-    $present = Test-Path -LiteralPath $p
-    Add ("   {0,-40} {1}" -f $c.Label, $(if ($present) { 'PRESENT' } else { '-' }))
-}
-Add ''
-$filesTxt = Join-Path $root 'files.txt'
-if (Test-Path -LiteralPath $filesTxt) {
-    Add " files.txt exists ($((Get-Item -LiteralPath $filesTxt).Length) bytes) - first 5 lines:"
-    Get-Content -LiteralPath $filesTxt -TotalCount 5 | ForEach-Object { Add "   | $_" }
-}
-$cmdline = Join-Path $root 'commandline.txt'
-if (Test-Path -LiteralPath $cmdline) {
-    Add ''
-    Add ' commandline.txt contents:'
-    Get-Content -LiteralPath $cmdline | ForEach-Object { Add "   | $_" }
-}
-Add ''
-
-# --- key data files the port cares about
-Add '================================================================================'
-Add ' KEY DATA FILES USED BY THE BROWSER PORT (presence + size)'
-Add '================================================================================'
-$keyFiles = @(
-    'common\data\gta.dat', 'common\data\handling.dat', 'common\data\timecyc.dat',
-    'common\data\WeaponInfo.xml', 'common\data\vehicles.ide', 'common\data\carcols.dat',
-    'common\data\peds.ide', 'common\data\default.ide', 'common\data\maps\paths.ipl',
-    'common\data\maps\paths2.ipl', 'common\data\maps\paths3.ipl', 'common\data\maps\paths4.ipl',
-    'common\text\*.gxt', 'pc\data\cdimages\navmeshes.img',
-    'pc\models\cdimages\vehicles.img', 'pc\models\cdimages\weapons.img',
-    'pc\models\cdimages\playerped.rpf', 'pc\models\cdimages\peds.img',
-    'pc\textures\skydome.wtd', 'pc\audio\sfx', 'pc\audio\radio'
-)
-foreach ($k in $keyFiles) {
-    $matches = @()
-    if ($k -like '*`**') {
-        $dir = Split-Path $k
-        $pat = Split-Path $k -Leaf
-        if (Test-Path -LiteralPath (Join-Path $root $dir)) {
-            $matches = Get-ChildItem -LiteralPath (Join-Path $root $dir) -Filter $pat -File -ErrorAction SilentlyContinue
-        }
-    } else {
-        $p = Join-Path $root $k
-        if (Test-Path -LiteralPath $p) { $matches = @(Get-Item -LiteralPath $p) }
-    }
-    if ($matches.Count -gt 0) {
-        foreach ($m in ($matches | Select-Object -First 3)) {
-            $rel = $m.FullName.Substring($root.Length).TrimStart('\', '/')
-            if ($m.PSIsContainer) {
-                $n = (Get-ChildItem -LiteralPath $m.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
-                $s = (Get-ChildItem -LiteralPath $m.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
-                Add ("   {0,-46} DIR, {1,5} files, {2,12:N0} bytes" -f $rel, $n, $s)
-            } else {
-                Add ("   {0,-46} {1,12:N0} bytes" -f $rel, $m.Length)
+            if ($i % 250 -eq 0) {
+                Write-Progress -Activity 'Inventorying GTA IV' -Status "$i / $total" `
+                               -PercentComplete ([int]($i / [math]::Max(1,$total) * 100))
             }
         }
-        if ($matches.Count -gt 3) { Add ("     ... and $($matches.Count - 3) more") }
-    } else {
-        Add ("   {0,-46} MISSING" -f $k)
+        Write-Progress -Activity 'Inventorying GTA IV' -Completed
+        $sw.Stop()
+
+        try {
+            $csv | Set-Content -LiteralPath $csvPath -Encoding UTF8
+            Write-Host "  manifest.csv   written ($([math]::Round($sw.Elapsed.TotalSeconds, 1))s)" -ForegroundColor Green
+        }
+        catch { Write-Warning "Could not write manifest.csv: $($_.Exception.Message)" }
+    }
+    else {
+        Write-Host "  manifest.csv   skipped (-SkipManifest)" -ForegroundColor Yellow
     }
 }
-Add ''
-Add '================================================================================'
-Add ' END OF INVENTORY'
-Add '================================================================================'
 
-$sum | Set-Content -LiteralPath (Join-Path $OutDir 'summary.txt') -Encoding UTF8
-Write-Host "  summary.txt    written" -ForegroundColor Green
+# =============================================================== 2. tree.txt
+
+Write-Host "  Building tree.txt ..." -ForegroundColor Gray
+$treeLines = New-Object System.Collections.Generic.List[string]
+
+Add-Section -Target $treeLines -Name 'tree' -Body {
+    $treeLines.Add("GTA IV installation tree (2 levels, sizes summed). Root path redacted.")
+    $treeLines.Add("Generated: $((Get-Date).ToString('u'))")
+    $treeLines.Add("")
+
+    $topDirs = @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Sort-Object Name)
+    foreach ($d in $topDirs) {
+        $sub  = @(Get-ChildItem -LiteralPath $d.FullName -Recurse -File -ErrorAction SilentlyContinue)
+        $nSub = Get-SafeCount $sub
+        $bSub = Get-SafeSum  $sub
+        $treeLines.Add(("{0,-42} {1,7} files {2,14:N0} bytes" -f ($d.Name + '\'), $nSub, $bSub))
+
+        $subDirs = @(Get-ChildItem -LiteralPath $d.FullName -Directory -ErrorAction SilentlyContinue | Sort-Object Name)
+        foreach ($d2 in $subDirs) {
+            $sub2  = @(Get-ChildItem -LiteralPath $d2.FullName -Recurse -File -ErrorAction SilentlyContinue)
+            $nSub2 = Get-SafeCount $sub2
+            $bSub2 = Get-SafeSum  $sub2
+            $treeLines.Add(("  {0,-40} {1,7} files {2,14:N0} bytes" -f ($d2.Name + '\'), $nSub2, $bSub2))
+        }
+    }
+}
+
+try {
+    $treeLines | Set-Content -LiteralPath $treePath -Encoding UTF8
+    Write-Host "  tree.txt       written" -ForegroundColor Green
+}
+catch { Write-Warning "Could not write tree.txt: $($_.Exception.Message)" }
+
+# ============================================================ 3. summary.txt
+
+Write-Host "  Building summary.txt ..." -ForegroundColor Gray
+$out = New-Object System.Collections.Generic.List[string]
+function Add($s) { $out.Add($s) }
+
+$totalBytes = Get-SafeSum $files
+$fileCount  = Get-SafeCount $files
+
+Add-Section -Target $out -Name 'header' -Body {
+    Add '================================================================================'
+    Add ' GTA IV INSTALLATION INVENTORY'
+    Add '================================================================================'
+    Add " Generated          : $((Get-Date).ToString('u'))"
+    Add " Scanner            : tools/gta4-inventory.ps1"
+    Add " Root path          : (redacted - not recorded)"
+    Add " Total files        : $fileCount"
+    Add " Total size         : $([math]::Round($totalBytes / 1GB, 2)) GB  ($('{0:N0}' -f $totalBytes) bytes)"
+    Add ''
+    Add ' NOTE ON SHARING'
+    Add ' ----------------'
+    Add ' This file contains filenames, sizes and hashes ONLY. It contains no game'
+    Add ' content and is safe to commit to a public repository or paste into a chat.'
+    Add ' The installation root path has been deliberately redacted.'
+    Add ''
+}
+
+# --- executables
+Add-Section -Target $out -Name 'executables' -Body {
+    Add '================================================================================'
+    Add ' EXECUTABLES'
+    Add '================================================================================'
+    $foundAny = $false
+    foreach ($name in @('GTAIV.exe', 'LaunchGTAIV.exe', 'EFLC.exe', 'LaunchEFLC.exe')) {
+        $p = Join-Path $root $name
+        if (Test-Path -LiteralPath $p) {
+            $foundAny = $true
+            $pe = Get-PEHeader -Path $p
+            Add ''
+            Add " $name"
+            foreach ($k in $pe.Keys) { Add ("   {0,-20} {1}" -f ($k + ':'), $pe[$k]) }
+        }
+    }
+    if (-not $foundAny) {
+        Add ''
+        Add ' No GTAIV.exe / EFLC.exe found at this root.'
+        Add ' The manifest root may be one level too high or too low.'
+    }
+    Add ''
+}
+
+# --- native DLL dependencies
+Add-Section -Target $out -Name 'dlls' -Body {
+    Add '================================================================================'
+    Add ' NATIVE DLL DEPENDENCIES / MIDDLEWARE MARKERS'
+    Add '================================================================================'
+    $markers = @(
+        'binkw32.dll', 'bink2w32.dll', 'xlive.dll', 'd3d9.dll', 'd3dx9_40.dll',
+        'd3dx9_41.dll', 'd3dx9_42.dll', 'd3dx9_43.dll', 'xinput1_3.dll', 'x3daudio1_7.dll',
+        'dsound.dll', 'GTAIVGDF.dll', 'LiveTokenHelper.dll', 'GameuxInstallHelper.dll',
+        'Paul.dll', 'DFA.dll', '1911.dll', 'openal32.dll', 'OpenAL32.dll',
+        'vorbisfile.dll', 'libspeex.dll', 'GFWLDownload.dll', 'ScriptHook.dll',
+        'ScriptHookDotNet.dll', 'dinput8.dll', 'winmm.dll'
+    )
+    foreach ($m in $markers) {
+        $p = Join-Path $root $m
+        if (Test-Path -LiteralPath $p) {
+            $len = 0
+            try { $len = (Get-Item -LiteralPath $p).Length } catch { }
+            Add ("   {0,-26} present   {1,12:N0} bytes" -f $m, $len)
+        }
+    }
+    $dllList = @(Get-ChildItem -LiteralPath $root -Filter '*.dll' -File -ErrorAction SilentlyContinue |
+                 Select-Object -ExpandProperty Name | Sort-Object)
+    Add ''
+    if ((Get-SafeCount $dllList) -gt 0) {
+        Add "   All DLLs in root: $($dllList -join ', ')"
+    }
+    else { Add '   No DLLs in root.' }
+    Add ''
+}
+
+# --- archive fingerprints
+Add-Section -Target $out -Name 'archive-magic' -Body {
+    Add '================================================================================'
+    Add ' ARCHIVE FINGERPRINTS (first 16 bytes; identifies the container format)'
+    Add '================================================================================'
+    $rpf = @($files | Where-Object { $_.FullName -match '\.(rpf|img)$' } | Sort-Object FullName)
+    Add ''
+    $rpfCount = Get-SafeCount $rpf
+    Add " Scanning $rpfCount .rpf / .img archives..."
+    Add ''
+
+    $magicTally = @{}
+    $samples    = @{}
+    foreach ($a in $rpf) {
+        if (-not (Test-Path -LiteralPath $a.FullName)) { continue }
+        $rel = $a.FullName.Substring($root.Length).TrimStart('\', '/')
+        $m   = Get-ArchiveMagic -Path $a.FullName
+        $key = ($m -split '\s+')[0]
+        if (-not $magicTally.ContainsKey($key)) {
+            $magicTally[$key] = 0
+            $samples[$key]    = @()
+        }
+        $magicTally[$key]++
+        if ((Get-SafeCount $samples[$key]) -lt 3) { $samples[$key] += $rel }
+    }
+
+    Add ' Summary by magic:'
+    foreach ($k in ($magicTally.Keys | Sort-Object { -$magicTally[$_] })) {
+        Add ("   {0,-12} {1,5} file(s)   e.g. {2}" -f $k, $magicTally[$k], ($samples[$k] -join ', '))
+    }
+    Add ''
+    Add ' Largest 15 archives:'
+    foreach ($a in ($rpf | Sort-Object Length -Descending | Select-Object -First 15)) {
+        $rel = $a.FullName.Substring($root.Length).TrimStart('\', '/')
+        $m   = Get-ArchiveMagic -Path $a.FullName
+        Add ("   {0,-52} {1,12:N0} bytes   {2}" -f $rel, $a.Length, $m)
+    }
+    Add ''
+}
+
+# --- extension breakdown
+Add-Section -Target $out -Name 'extensions' -Body {
+    Add '================================================================================'
+    Add ' FILE COUNT AND SIZE BY EXTENSION (top 40 by count)'
+    Add '================================================================================'
+    Add ("   {0,-14} {1,8} {2,16} {3,12}" -f 'EXT', 'COUNT', 'BYTES', 'GB')
+    $byExt = @($files | Group-Object { if ($_.FullName -match '\.([^.\\/]+)$') { $Matches[1].ToLowerInvariant() } else { '(none)' } })
+    foreach ($g in ($byExt | Sort-Object Count -Descending | Select-Object -First 40)) {
+        $s = Get-SafeSum $g.Group
+        Add ("   {0,-14} {1,8} {2,16:N0} {3,12:N3}" -f $g.Name, $g.Count, $s, ($s / 1GB))
+    }
+    Add ''
+}
+
+# --- edition / version detection
+Add-Section -Target $out -Name 'edition' -Body {
+    Add '================================================================================'
+    Add ' EDITION AND VERSION MARKERS'
+    Add '================================================================================'
+    $checks = @(
+        @{ Label = 'GTA IV base (common\data)';          Path = 'common\data' }
+        @{ Label = 'TLAD episode (Lost and Damned)';     Path = 'TLAD' }
+        @{ Label = 'TBoGT episode (Ballad of Gay Tony)'; Path = 'TBoGT' }
+        @{ Label = 'EFLC root';                          Path = 'EFLC' }
+        @{ Label = 'PC data tree';                       Path = 'pc' }
+        @{ Label = 'Common tree';                        Path = 'common' }
+        @{ Label = 'Shaders (common\shaders)';           Path = 'common\shaders' }
+        @{ Label = 'Shader DB (common\shaders\db)';      Path = 'common\shaders\db' }
+        @{ Label = 'Audio (pc\audio)';                   Path = 'pc\audio' }
+        @{ Label = 'SFX (pc\audio\sfx)';                 Path = 'pc\audio\sfx' }
+        @{ Label = 'Radio (pc\audio\radio)';             Path = 'pc\audio\radio' }
+        @{ Label = 'Models (pc\models\cdimages)';        Path = 'pc\models\cdimages' }
+        @{ Label = 'Textures (pc\textures)';             Path = 'pc\textures' }
+        @{ Label = 'Map data (pc\data\cdimages)';        Path = 'pc\data\cdimages' }
+        @{ Label = 'Installers';                         Path = 'Installers' }
+        @{ Label = 'DirectX redist';                     Path = 'Installers\DirectX' }
+    )
+    foreach ($c in $checks) {
+        $present = Test-Path -LiteralPath (Join-Path $root $c.Path)
+        Add ("   {0,-40} {1}" -f $c.Label, $(if ($present) { 'PRESENT' } else { '-' }))
+    }
+    Add ''
+    $filesTxt = Join-Path $root 'files.txt'
+    if (Test-Path -LiteralPath $filesTxt) {
+        Add " files.txt exists ($((Get-Item -LiteralPath $filesTxt).Length) bytes) - first 5 lines:"
+        Get-Content -LiteralPath $filesTxt -TotalCount 5 -ErrorAction SilentlyContinue | ForEach-Object { Add "   | $_" }
+    }
+    $cmdline = Join-Path $root 'commandline.txt'
+    if (Test-Path -LiteralPath $cmdline) {
+        Add ''
+        Add ' commandline.txt contents:'
+        Get-Content -LiteralPath $cmdline -ErrorAction SilentlyContinue | ForEach-Object { Add "   | $_" }
+    }
+    Add ''
+}
+
+# --- key data files
+Add-Section -Target $out -Name 'key-files' -Body {
+    Add '================================================================================'
+    Add ' KEY DATA FILES USED BY THE BROWSER PORT (presence + size)'
+    Add '================================================================================'
+    $keyFiles = @(
+        'common\data\gta.dat', 'common\data\handling.dat', 'common\data\timecyc.dat',
+        'common\data\WeaponInfo.xml', 'common\data\vehicles.ide', 'common\data\carcols.dat',
+        'common\data\peds.ide', 'common\data\default.ide', 'common\data\maps\paths.ipl',
+        'common\data\maps\paths2.ipl', 'common\data\maps\paths3.ipl', 'common\data\maps\paths4.ipl',
+        'pc\data\cdimages\navmeshes.img',
+        'pc\models\cdimages\vehicles.img', 'pc\models\cdimages\weapons.img',
+        'pc\models\cdimages\playerped.rpf', 'pc\models\cdimages\peds.img',
+        'pc\textures\skydome.wtd', 'pc\audio\sfx', 'pc\audio\radio'
+    )
+    foreach ($k in $keyFiles) {
+        $p = Join-Path $root $k
+        if (Test-Path -LiteralPath $p) {
+            $item = Get-Item -LiteralPath $p
+            if ($item.PSIsContainer) {
+                $inner = @(Get-ChildItem -LiteralPath $p -Recurse -File -ErrorAction SilentlyContinue)
+                Add ("   {0,-46} DIR, {1,5} files, {2,12:N0} bytes" -f $k, (Get-SafeCount $inner), (Get-SafeSum $inner))
+            }
+            else {
+                Add ("   {0,-46} {1,12:N0} bytes" -f $k, $item.Length)
+            }
+        }
+        else { Add ("   {0,-46} MISSING" -f $k) }
+    }
+    Add ''
+}
+
+Add-Section -Target $out -Name 'footer' -Body {
+    Add '================================================================================'
+    Add ' END OF INVENTORY'
+    Add '================================================================================'
+}
+
+try {
+    $out | Set-Content -LiteralPath $sumPath -Encoding UTF8
+    Write-Host "  summary.txt    written" -ForegroundColor Green
+}
+catch { Write-Warning "Could not write summary.txt: $($_.Exception.Message)" }
 
 # --------------------------------------------------------------------- wrap up
 
@@ -498,14 +620,15 @@ Write-Host ""
 Write-Host "  Done. Output in:" -ForegroundColor Cyan
 Write-Host "    $OutDir"
 Write-Host ""
-Get-ChildItem -LiteralPath $OutDir -File | ForEach-Object {
-    Write-Host ("      {0,-16} {1,10:N0} bytes" -f $_.Name, $_.Length)
+Get-ChildItem -LiteralPath $OutDir -File -ErrorAction SilentlyContinue | ForEach-Object {
+    Write-Host ("      {0,-16} {1,12:N0} bytes" -f $_.Name, $_.Length)
 }
 Write-Host ""
 Write-Host "  NEXT STEP" -ForegroundColor Yellow
-Write-Host "  Read summary.txt first. Then share either:"
-Write-Host "    - summary.txt + tree.txt  (small, paste straight into chat), or"
-Write-Host "    - the whole gta4-inventory folder (commit it, or paste the text)."
+Write-Host "  Read summary.txt first, then commit the folder:"
+Write-Host "      git add tools/gta4-inventory"
+Write-Host "      git commit -m 'Add GTA IV installation inventory'"
+Write-Host "      git push"
 Write-Host ""
 Write-Host "  Do NOT upload the game itself, and do not commit web/assets or web/data."
 Write-Host ""
