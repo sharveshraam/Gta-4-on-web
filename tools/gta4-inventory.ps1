@@ -289,7 +289,12 @@ function Get-ArchiveMagic {
             return 'ELF - Linux executable'
         }
 
-        return ('unknown (0x{0:x2}{1:x2}{2:x2}{3:x2})' -f $buf[0], $buf[1], $buf[2], $buf[3])
+        $hex = ('0x{0:x2}{1:x2}{2:x2}{3:x2}' -f $buf[0], $buf[1], $buf[2], $buf[3])
+        # GTA IV .img files carry a header value that is not one of the known IMG
+        # magics. They are still valid RAGE archives - gta4-webmap and RageLib read
+        # them - so say so rather than reporting a bare "unknown".
+        if ($Path -match '\.img$') { return "IMG  - RAGE archive (magic $hex not in table)" }
+        return "unknown ($hex)"
     }
     catch { return "(unreadable: $($_.Exception.Message))" }
     finally { if ($fs) { $fs.Dispose() } }
@@ -606,29 +611,48 @@ Add-Section -Target $out -Name 'key-files' -Body {
     Add '================================================================================'
     Add ' KEY DATA FILES USED BY THE BROWSER PORT (presence + size)'
     Add '================================================================================'
-    $keyFiles = @(
-        'common\data\gta.dat', 'common\data\handling.dat', 'common\data\timecyc.dat',
-        'common\data\WeaponInfo.xml', 'common\data\vehicles.ide', 'common\data\carcols.dat',
-        'common\data\peds.ide', 'common\data\default.ide', 'common\data\maps\paths.ipl',
-        'common\data\maps\paths2.ipl', 'common\data\maps\paths3.ipl', 'common\data\maps\paths4.ipl',
-        'pc\data\cdimages\navmeshes.img',
-        'pc\models\cdimages\vehicles.img', 'pc\models\cdimages\weapons.img',
-        'pc\models\cdimages\playerped.rpf', 'pc\models\cdimages\peds.img',
-        'pc\textures\skydome.wtd', 'pc\audio\sfx', 'pc\audio\radio'
-    )
-    foreach ($k in $keyFiles) {
+    # Timecycle lives under pc\data in the Complete Edition, NOT common\data -
+    # checking only common\data produced a false MISSING. Both are probed.
+    # Peds are assembled from componentpeds.img; there is no peds.img in GTA IV.
+    $keyFiles = [ordered]@{
+        'World definition (gta.dat)'           = 'common\data\gta.dat'
+        'Vehicle handling'                     = 'common\data\handling.dat'
+        'Timecycle / lighting (pc\data)'       = 'pc\data\timecyc.dat'
+        'Timecycle / lighting (common\data)'   = 'common\data\timecyc.dat'
+        'Weapon stats'                         = 'common\data\WeaponInfo.xml'
+        'Vehicle catalogue'                    = 'common\data\vehicles.ide'
+        'Vehicle colours'                      = 'common\data\carcols.dat'
+        'Ped catalogue'                        = 'common\data\peds.ide'
+        'Item definitions'                     = 'common\data\default.ide'
+        'Road network 1'                       = 'common\data\maps\paths.ipl'
+        'Road network 2'                       = 'common\data\maps\paths2.ipl'
+        'Boat lanes'                           = 'common\data\maps\paths3.ipl'
+        'Network paths 4'                      = 'common\data\maps\paths4.ipl'
+        'Ped navmesh'                          = 'pc\data\cdimages\navmeshes.img'
+        'Vehicles'                             = 'pc\models\cdimages\vehicles.img'
+        'Weapons'                              = 'pc\models\cdimages\weapons.img'
+        'Player model'                         = 'pc\models\cdimages\playerped.rpf'
+        'Ped components'                       = 'pc\models\cdimages\componentpeds.img'
+        'Cutscene animation'                   = 'pc\anim\cuts.img'
+        'Sky textures'                         = 'pc\textures\skydome.wtd'
+        'Audio SFX'                            = 'pc\audio\sfx'
+        'Audio radio'                          = 'pc\audio\radio'
+    }
+    foreach ($entry in $keyFiles.GetEnumerator()) {
+        $label = $entry.Key
+        $k     = $entry.Value
         $p = Join-Path $root $k
         if (Test-Path -LiteralPath $p) {
             $item = Get-Item -LiteralPath $p
             if ($item.PSIsContainer) {
                 $inner = @(Get-ChildItem -LiteralPath $p -Recurse -File -ErrorAction SilentlyContinue)
-                Add ("   {0,-46} DIR, {1,5} files, {2,12:N0} bytes" -f $k, (Get-SafeCount $inner), (Get-SafeSum $inner))
+                Add ("   {0,-34} {1,-46} DIR, {2,5} files, {3,12:N0} bytes" -f $label, $k, (Get-SafeCount $inner), (Get-SafeSum $inner))
             }
             else {
-                Add ("   {0,-46} {1,12:N0} bytes" -f $k, $item.Length)
+                Add ("   {0,-34} {1,-46} {2,12:N0} bytes" -f $label, $k, $item.Length)
             }
         }
-        else { Add ("   {0,-46} MISSING" -f $k) }
+        else { Add ("   {0,-34} {1,-46} MISSING" -f $label, $k) }
     }
     Add ''
 }

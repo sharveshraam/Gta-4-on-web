@@ -128,7 +128,10 @@ def strip_root(paths):
 KEY_FILES = [
     ("World definition (gta.dat)",        "common/data/gta.dat"),
     ("Vehicle handling",                  "common/data/handling.dat"),
-    ("Timecycle / lighting",              "common/data/timecyc.dat"),
+    # Complete Edition keeps timecyc under pc/data - common/data/timecyc.dat is
+    # the wrong path and yields a false MISSING.
+    ("Timecycle / lighting (pc/data)",    "pc/data/timecyc.dat"),
+    ("Timecycle / lighting (common/data)", "common/data/timecyc.dat"),
     ("Weapon stats",                      "common/data/WeaponInfo.xml"),
     ("Vehicle catalogue",                 "common/data/vehicles.ide"),
     ("Vehicle colours",                   "common/data/carcols.dat"),
@@ -142,7 +145,9 @@ KEY_FILES = [
     ("Vehicles",                          "pc/models/cdimages/vehicles.img"),
     ("Weapons",                           "pc/models/cdimages/weapons.img"),
     ("Player model",                      "pc/models/cdimages/playerped.rpf"),
-    ("Ped models",                        "pc/models/cdimages/peds.img"),
+    # GTA IV has no peds.img - peds are assembled from componentpeds.img.
+    ("Ped components",                    "pc/models/cdimages/componentpeds.img"),
+    ("Cutscene animation",                "pc/anim/cuts.img"),
     ("Sky textures",                      "pc/textures/skydome.wtd"),
 ]
 
